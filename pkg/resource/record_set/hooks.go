@@ -107,7 +107,7 @@ func (rm *resourceManager) newResourceRecordSet(
 ) (*svcsdktypes.ResourceRecordSet, error) {
 	res := &svcsdktypes.ResourceRecordSet{}
 
-	domain, err := rm.getHostedZoneDomain(ctx, r)
+	domain, err := rm.getHostedZoneDomainCached(ctx, aws.ToString(r.ko.Spec.HostedZoneID))
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +161,9 @@ func (rm *resourceManager) newResourceRecordSet(
 
 // newChangeBatch returns a pointer to a ChangeBatch object
 // with each field set by the resource's corresponding spec field.
+// NOTE: This function is kept for backward compatibility but is no longer
+// used in the main code path. The BatchDispatcher builds multi-element
+// batches directly.
 func (rm *resourceManager) newChangeBatch(
 	action svcsdktypes.ChangeAction,
 	recordSet *svcsdktypes.ResourceRecordSet,
@@ -191,43 +194,44 @@ func (rm *resourceManager) customUpdateRecordSet(
 	// the original Kubernetes object we passed to the function
 	ko := desired.ko.DeepCopy()
 
-	input := &svcsdk.ChangeResourceRecordSetsInput{}
-	input.HostedZoneId = desired.ko.Spec.HostedZoneID
-
-	action := svcsdktypes.ChangeActionUpsert
 	recordSet, err := rm.newResourceRecordSet(ctx, desired)
 	if err != nil {
 		return nil, err
 	}
-	changeBatch := rm.newChangeBatch(action, recordSet)
-	input.ChangeBatch = changeBatch
 
-	var resp *svcsdk.ChangeResourceRecordSetsOutput
-	resp, err = rm.sdkapi.ChangeResourceRecordSets(ctx, input)
-	rm.metrics.RecordAPICall("UPDATE", "ChangeResourceRecordSets", err)
+	// Enqueue into batch dispatcher instead of calling Route53 directly
+	result := rm.batchDispatcher.Enqueue(
+		ctx,
+		*desired.ko.Spec.HostedZoneID,
+		svcsdktypes.ChangeActionUpsert,
+		recordSet,
+	)
+	rm.metrics.RecordAPICall("UPDATE", "ChangeResourceRecordSets", result.err)
 
 	// The previous change batch is no longer representative of the newly applied change.
-	if err != nil {
+	if result.err != nil {
 		ko.Status.ID = nil
 		ko.Status.Status = nil
 		ko.Status.SubmittedAt = nil
-		return &resource{ko}, err
+		return &resource{ko}, result.err
 	}
 
-	if resp.ChangeInfo.Id != nil {
-		ko.Status.ID = resp.ChangeInfo.Id
-	} else {
-		ko.Status.ID = nil
-	}
-	if resp.ChangeInfo.Status != "" {
-		ko.Status.Status = aws.String(string(resp.ChangeInfo.Status))
-	} else {
-		ko.Status.Status = nil
-	}
-	if resp.ChangeInfo.SubmittedAt != nil {
-		ko.Status.SubmittedAt = &metav1.Time{*resp.ChangeInfo.SubmittedAt}
-	} else {
-		ko.Status.SubmittedAt = nil
+	if result.changeInfo != nil {
+		if result.changeInfo.Id != nil {
+			ko.Status.ID = result.changeInfo.Id
+		} else {
+			ko.Status.ID = nil
+		}
+		if result.changeInfo.Status != "" {
+			ko.Status.Status = aws.String(string(result.changeInfo.Status))
+		} else {
+			ko.Status.Status = nil
+		}
+		if result.changeInfo.SubmittedAt != nil {
+			ko.Status.SubmittedAt = &metav1.Time{Time: *result.changeInfo.SubmittedAt}
+		} else {
+			ko.Status.SubmittedAt = nil
+		}
 	}
 
 	rm.setStatusDefaults(ko)
@@ -247,6 +251,9 @@ func (rm *resourceManager) customUpdateRecordSet(
 // syncStatus will sync the state of record sets. PENDING indicates that the
 // request has not yet been applied to all Route53 DNS servers and INSYNC
 // represents that the request has been fully propagated to all DNS servers.
+//
+// Uses the changeStatusDispatcher: one GetChange call per change ID per
+// flush interval serves all reconcilers that share the same batch.
 func (rm *resourceManager) syncStatus(
 	ctx context.Context,
 	ko *svcapitypes.RecordSet,
@@ -257,24 +264,18 @@ func (rm *resourceManager) syncStatus(
 		exit(err)
 	}()
 
-	// It is possible to hit this condition if the previous change batch was
-	// invalid (e.g. bad parameter). In such cases, a new change ID will be
-	// assigned after going through a successful update.
 	if ko.Status.ID == nil {
 		ko.Status.Status = nil
 		return nil
 	}
 
-	changeInput := &svcsdk.GetChangeInput{}
-	changeInput.Id = ko.Status.ID
+	changeID := *ko.Status.ID
 
-	resp, err := rm.sdkapi.GetChange(ctx, changeInput)
-	rm.metrics.RecordAPICall("READ_ONE", "GetChange", err)
+	status, err := globalChangeDispatcher.GetStatus(ctx, changeID)
 	if err != nil {
 		return err
 	}
 
-	status := string(resp.ChangeInfo.Status)
 	ko.Status.Status = &status
 	return nil
 }

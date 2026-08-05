@@ -35,6 +35,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	svcsdk "github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/go-logr/logr"
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 
 	svcapitypes "github.com/aws-controllers-k8s/route53-controller/apis/v1alpha1"
@@ -80,6 +81,15 @@ type resourceManager struct {
 	// sdk is a pointer to the AWS service API client exposed by the
 	// aws-sdk-go-v2/services/{alias} package.
 	sdkapi *svcsdk.Client
+	// batchDispatcher batches ChangeResourceRecordSets calls per hosted zone
+	// to reduce API call volume and stay within Route53's rate limits.
+	batchDispatcher *BatchDispatcher
+	// readDispatcher batches ListResourceRecordSets calls per hosted zone.
+	// One fetch per zone per flush interval serves all concurrent reconcilers.
+	readDispatcher *ReadDispatcher
+	// rateLimiter is shared across ALL Route53 API calls (reads and writes)
+	// to stay within the 5 req/s account-level limit.
+	rateLimiter *rate.Limiter
 }
 
 // concreteResource returns a pointer to a resource from the supplied
@@ -340,6 +350,14 @@ func newResourceManager(
 	id ackv1alpha1.AWSAccountID,
 	region ackv1alpha1.AWSRegion,
 ) (*resourceManager, error) {
+	sdkapi := svcsdk.NewFromConfig(clientcfg)
+	batchConfig := DefaultBatchConfig()
+	// Don't rate limit writes — the batching itself reduces API call volume.
+	// Route53's server-side throttling + SDK retries handle the rest.
+	batchConfig.RateLimit = 100 // effectively unlimited for this POC
+	readDisp := NewReadDispatcher(sdkapi, metrics, log, 5*time.Second)
+	initChangeDispatcher(sdkapi, 500*time.Millisecond) // short window — just coalesce concurrent calls
+
 	return &resourceManager{
 		cfg:          cfg,
 		clientcfg:    clientcfg,
@@ -349,7 +367,15 @@ func newResourceManager(
 		awsAccountID: id,
 		awsRegion:    region,
 		awsPartition: ackv1alpha1.AWSPartition(cfg.Partition),
-		sdkapi:       svcsdk.NewFromConfig(clientcfg),
+		sdkapi:       sdkapi,
+		rateLimiter:  nil,
+		readDispatcher: readDisp,
+		batchDispatcher: NewBatchDispatcher(
+			sdkapi,
+			metrics,
+			log,
+			batchConfig,
+		),
 	}, nil
 }
 

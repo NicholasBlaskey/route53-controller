@@ -70,32 +70,18 @@ func (rm *resourceManager) sdkFind(
 		return nil, ackerr.NotFound
 	}
 
-	input, err := rm.newListRequestPayload(r)
-	if err != nil {
-		return nil, err
-	}
-
 	// Retrieve the domain name of the hosted zone through the ID.
-	domain, err := rm.getHostedZoneDomain(ctx, r)
+	domain, err := rm.getHostedZoneDomainCached(ctx, aws.ToString(r.ko.Spec.HostedZoneID))
 	if err != nil {
 		return nil, err
 	}
 
 	dnsName := rm.getDNSName(aws.ToString(r.ko.Spec.Name), domain)
 
-	// Setting the starting point to the following values reduces the number of irrelevant
-	// records that are returned.
-	input.StartRecordName = &dnsName
-	if r.ko.Spec.RecordType != nil {
-		input.StartRecordType = svcsdktypes.RRType(*r.ko.Spec.RecordType)
-	}
-	if r.ko.Spec.SetIdentifier != nil {
-		input.StartRecordIdentifier = r.ko.Spec.SetIdentifier
-	}
-
-	var resp *svcsdk.ListResourceRecordSetsOutput
-	resp, err = rm.sdkapi.ListResourceRecordSets(ctx, input)
-	rm.metrics.RecordAPICall("READ_MANY", "ListResourceRecordSets", err)
+	// Use the ReadDispatcher — same queue pattern as writes. All concurrent
+	// reconcilers for the same zone share one ListResourceRecordSets call
+	// per flush interval (5s).
+	allRecords, err := rm.readDispatcher.List(ctx, aws.ToString(r.ko.Spec.HostedZoneID))
 	if err != nil {
 		var awsErr smithy.APIError
 		if errors.As(err, &awsErr) && awsErr.ErrorCode() == "NoSuchHostedZone" {
@@ -103,6 +89,11 @@ func (rm *resourceManager) sdkFind(
 		}
 		return nil, err
 	}
+
+	resp := &svcsdk.ListResourceRecordSetsOutput{
+		ResourceRecordSets: allRecords,
+	}
+	_ = dnsName
 
 	// Merge in the information we read from the API call above to the copy of
 	// the original Kubernetes object we passed to the function
@@ -341,44 +332,44 @@ func (rm *resourceManager) sdkCreate(
 	defer func() {
 		exit(err)
 	}()
-	input, err := rm.newCreateRequestPayload(ctx, desired)
-	if err != nil {
-		return nil, err
-	}
 
-	action := svcsdktypes.ChangeActionCreate
 	recordSet, err := rm.newResourceRecordSet(ctx, desired)
 	if err != nil {
 		return nil, err
 	}
-	changeBatch := rm.newChangeBatch(action, recordSet)
-	input.ChangeBatch = changeBatch
 
-	var resp *svcsdk.ChangeResourceRecordSetsOutput
-	_ = resp
-	resp, err = rm.sdkapi.ChangeResourceRecordSets(ctx, input)
-	rm.metrics.RecordAPICall("CREATE", "ChangeResourceRecordSets", err)
-	if err != nil {
-		return nil, err
+	// Enqueue into batch dispatcher instead of calling Route53 directly
+	result := rm.batchDispatcher.Enqueue(
+		ctx,
+		*desired.ko.Spec.HostedZoneID,
+		svcsdktypes.ChangeActionCreate,
+		recordSet,
+	)
+	rm.metrics.RecordAPICall("CREATE", "ChangeResourceRecordSets", result.err)
+	if result.err != nil {
+		return nil, result.err
 	}
+
 	// Merge in the information we read from the API call above to the copy of
 	// the original Kubernetes object we passed to the function
 	ko := desired.ko.DeepCopy()
 
-	if resp.ChangeInfo.Id != nil {
-		ko.Status.ID = resp.ChangeInfo.Id
-	} else {
-		ko.Status.ID = nil
-	}
-	if resp.ChangeInfo.Status != "" {
-		ko.Status.Status = aws.String(string(resp.ChangeInfo.Status))
-	} else {
-		ko.Status.Status = nil
-	}
-	if resp.ChangeInfo.SubmittedAt != nil {
-		ko.Status.SubmittedAt = &metav1.Time{*resp.ChangeInfo.SubmittedAt}
-	} else {
-		ko.Status.SubmittedAt = nil
+	if result.changeInfo != nil {
+		if result.changeInfo.Id != nil {
+			ko.Status.ID = result.changeInfo.Id
+		} else {
+			ko.Status.ID = nil
+		}
+		if result.changeInfo.Status != "" {
+			ko.Status.Status = aws.String(string(result.changeInfo.Status))
+		} else {
+			ko.Status.Status = nil
+		}
+		if result.changeInfo.SubmittedAt != nil {
+			ko.Status.SubmittedAt = &metav1.Time{Time: *result.changeInfo.SubmittedAt}
+		} else {
+			ko.Status.SubmittedAt = nil
+		}
 	}
 
 	rm.setStatusDefaults(ko)
@@ -421,24 +412,21 @@ func (rm *resourceManager) sdkDelete(
 	defer func() {
 		exit(err)
 	}()
-	input, err := rm.newDeleteRequestPayload(r)
-	if err != nil {
-		return nil, err
-	}
 
-	action := svcsdktypes.ChangeActionDelete
 	recordSet, err := rm.newResourceRecordSet(ctx, r)
 	if err != nil {
 		return nil, err
 	}
-	changeBatch := rm.newChangeBatch(action, recordSet)
-	input.ChangeBatch = changeBatch
 
-	var resp *svcsdk.ChangeResourceRecordSetsOutput
-	_ = resp
-	resp, err = rm.sdkapi.ChangeResourceRecordSets(ctx, input)
-	rm.metrics.RecordAPICall("DELETE", "ChangeResourceRecordSets", err)
-	return nil, err
+	// Enqueue into batch dispatcher instead of calling Route53 directly
+	result := rm.batchDispatcher.Enqueue(
+		ctx,
+		*r.ko.Spec.HostedZoneID,
+		svcsdktypes.ChangeActionDelete,
+		recordSet,
+	)
+	rm.metrics.RecordAPICall("DELETE", "ChangeResourceRecordSets", result.err)
+	return nil, result.err
 }
 
 // newDeleteRequestPayload returns an SDK-specific struct for the HTTP request
