@@ -7,3 +7,12 @@
 bin
 build
 .env
+
+
+# Queue-level batching POC
+forks/
+test/harness/controller-bin
+test/harness/harness-bin
+test/harness/harness
+test/harness/controller.log
+controller

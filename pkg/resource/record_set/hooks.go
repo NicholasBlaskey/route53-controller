@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	svcapitypes "github.com/aws-controllers-k8s/route53-controller/apis/v1alpha1"
+	"github.com/aws-controllers-k8s/route53-controller/pkg/batch"
 	ackcompare "github.com/aws-controllers-k8s/runtime/pkg/compare"
 	ackcondition "github.com/aws-controllers-k8s/runtime/pkg/condition"
 	ackerr "github.com/aws-controllers-k8s/runtime/pkg/errors"
@@ -187,55 +188,72 @@ func (rm *resourceManager) customUpdateRecordSet(
 		exit(err)
 	}()
 
-	// Merge in the information we read from the API call above to the copy of
-	// the original Kubernetes object we passed to the function
 	ko := desired.ko.DeepCopy()
 
-	input := &svcsdk.ChangeResourceRecordSetsInput{}
-	input.HostedZoneId = desired.ko.Spec.HostedZoneID
-
-	action := svcsdktypes.ChangeActionUpsert
 	recordSet, err := rm.newResourceRecordSet(ctx, desired)
 	if err != nil {
 		return nil, err
 	}
-	changeBatch := rm.newChangeBatch(action, recordSet)
-	input.ChangeBatch = changeBatch
 
-	var resp *svcsdk.ChangeResourceRecordSetsOutput
-	resp, err = rm.sdkapi.ChangeResourceRecordSets(ctx, input)
-	rm.metrics.RecordAPICall("UPDATE", "ChangeResourceRecordSets", err)
+	var changeInfo *svcsdktypes.ChangeInfo
 
-	// The previous change batch is no longer representative of the newly applied change.
-	if err != nil {
-		ko.Status.ID = nil
-		ko.Status.Status = nil
-		ko.Status.SubmittedAt = nil
-		return &resource{ko}, err
+	if rm.batchAggregator != nil {
+		// Use batch aggregator for improved throughput
+		result := rm.batchAggregator.Submit(ctx, batch.RecordChange{
+			HostedZoneID: aws.ToString(desired.ko.Spec.HostedZoneID),
+			Action:       svcsdktypes.ChangeActionUpsert,
+			RecordSet:    recordSet,
+		})
+		if result.Err != nil {
+			ko.Status.ID = nil
+			ko.Status.Status = nil
+			ko.Status.SubmittedAt = nil
+			return &resource{ko}, result.Err
+		}
+		changeInfo = result.ChangeInfo
+	} else {
+		// Fallback: direct API call (original behavior)
+		input := &svcsdk.ChangeResourceRecordSetsInput{}
+		input.HostedZoneId = desired.ko.Spec.HostedZoneID
+		changeBatch := rm.newChangeBatch(svcsdktypes.ChangeActionUpsert, recordSet)
+		input.ChangeBatch = changeBatch
+
+		resp, apiErr := rm.sdkapi.ChangeResourceRecordSets(ctx, input)
+		rm.metrics.RecordAPICall("UPDATE", "ChangeResourceRecordSets", apiErr)
+		if apiErr != nil {
+			ko.Status.ID = nil
+			ko.Status.Status = nil
+			ko.Status.SubmittedAt = nil
+			return &resource{ko}, apiErr
+		}
+		changeInfo = resp.ChangeInfo
 	}
 
-	if resp.ChangeInfo.Id != nil {
-		ko.Status.ID = resp.ChangeInfo.Id
+	if changeInfo.Id != nil {
+		ko.Status.ID = changeInfo.Id
 	} else {
 		ko.Status.ID = nil
 	}
-	if resp.ChangeInfo.Status != "" {
-		ko.Status.Status = aws.String(string(resp.ChangeInfo.Status))
+	if changeInfo.Status != "" {
+		ko.Status.Status = aws.String(string(changeInfo.Status))
 	} else {
 		ko.Status.Status = nil
 	}
-	if resp.ChangeInfo.SubmittedAt != nil {
-		ko.Status.SubmittedAt = &metav1.Time{*resp.ChangeInfo.SubmittedAt}
+	if changeInfo.SubmittedAt != nil {
+		ko.Status.SubmittedAt = &metav1.Time{Time: *changeInfo.SubmittedAt}
 	} else {
 		ko.Status.SubmittedAt = nil
 	}
 
 	rm.setStatusDefaults(ko)
 
-	// Ensure that the status eventually becomes INSYNC after an update has been detected
-	err = rm.syncStatus(ctx, ko)
-	if err != nil {
-		return nil, err
+	// When batching, skip the per-CR syncStatus call — the shared ChangeInfo
+	// already tells us the status is PENDING and we can requeue to check later.
+	if rm.batchAggregator == nil {
+		err = rm.syncStatus(ctx, ko)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if ko.Status.Status == nil || svcsdktypes.ChangeStatus(*ko.Status.Status) == svcsdktypes.ChangeStatusPending {
 		ackcondition.SetSynced(&resource{ko}, corev1.ConditionFalse, nil, nil)
@@ -292,6 +310,15 @@ func (rm *resourceManager) getHostedZoneDomain(
 		exit(err)
 	}()
 
+	hostedZoneID := aws.ToString(r.ko.Spec.HostedZoneID)
+
+	// Check cache first
+	if rm.hostedZoneCache != nil {
+		if domain, ok := rm.hostedZoneCache.Get(hostedZoneID); ok {
+			return domain, nil
+		}
+	}
+
 	input := &svcsdk.GetHostedZoneInput{}
 	if r.ko.Spec.HostedZoneID != nil {
 		input.Id = r.ko.Spec.HostedZoneID
@@ -306,7 +333,15 @@ func (rm *resourceManager) getHostedZoneDomain(
 		}
 		return "", err
 	}
-	return *resp.HostedZone.Name, nil
+
+	domain := *resp.HostedZone.Name
+
+	// Store in cache
+	if rm.hostedZoneCache != nil {
+		rm.hostedZoneCache.Put(hostedZoneID, domain)
+	}
+
+	return domain, nil
 }
 
 // getDNSName constructs a fully qualified DNS name from the user-supplied name

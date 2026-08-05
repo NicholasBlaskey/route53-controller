@@ -36,6 +36,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	svcapitypes "github.com/aws-controllers-k8s/route53-controller/apis/v1alpha1"
+	"github.com/aws-controllers-k8s/route53-controller/pkg/batch"
 )
 
 // Hack to avoid import errors during build...
@@ -346,37 +347,56 @@ func (rm *resourceManager) sdkCreate(
 		return nil, err
 	}
 
-	action := svcsdktypes.ChangeActionCreate
 	recordSet, err := rm.newResourceRecordSet(ctx, desired)
 	if err != nil {
 		return nil, err
 	}
-	changeBatch := rm.newChangeBatch(action, recordSet)
-	input.ChangeBatch = changeBatch
 
-	var resp *svcsdk.ChangeResourceRecordSetsOutput
-	_ = resp
-	resp, err = rm.sdkapi.ChangeResourceRecordSets(ctx, input)
-	rm.metrics.RecordAPICall("CREATE", "ChangeResourceRecordSets", err)
-	if err != nil {
-		return nil, err
-	}
 	// Merge in the information we read from the API call above to the copy of
 	// the original Kubernetes object we passed to the function
 	ko := desired.ko.DeepCopy()
 
-	if resp.ChangeInfo.Id != nil {
-		ko.Status.ID = resp.ChangeInfo.Id
+	var changeInfo *svcsdktypes.ChangeInfo
+
+	if rm.batchAggregator != nil {
+		// Use batch aggregator for improved throughput
+		result := rm.batchAggregator.Submit(ctx, batch.RecordChange{
+			HostedZoneID: aws.ToString(desired.ko.Spec.HostedZoneID),
+			Action:       svcsdktypes.ChangeActionCreate,
+			RecordSet:    recordSet,
+		})
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		changeInfo = result.ChangeInfo
+	} else {
+		// Fallback: direct API call (original behavior)
+		action := svcsdktypes.ChangeActionCreate
+		changeBatch := rm.newChangeBatch(action, recordSet)
+		input.ChangeBatch = changeBatch
+
+		var resp *svcsdk.ChangeResourceRecordSetsOutput
+		_ = resp
+		resp, err = rm.sdkapi.ChangeResourceRecordSets(ctx, input)
+		rm.metrics.RecordAPICall("CREATE", "ChangeResourceRecordSets", err)
+		if err != nil {
+			return nil, err
+		}
+		changeInfo = resp.ChangeInfo
+	}
+
+	if changeInfo.Id != nil {
+		ko.Status.ID = changeInfo.Id
 	} else {
 		ko.Status.ID = nil
 	}
-	if resp.ChangeInfo.Status != "" {
-		ko.Status.Status = aws.String(string(resp.ChangeInfo.Status))
+	if changeInfo.Status != "" {
+		ko.Status.Status = aws.String(string(changeInfo.Status))
 	} else {
 		ko.Status.Status = nil
 	}
-	if resp.ChangeInfo.SubmittedAt != nil {
-		ko.Status.SubmittedAt = &metav1.Time{*resp.ChangeInfo.SubmittedAt}
+	if changeInfo.SubmittedAt != nil {
+		ko.Status.SubmittedAt = &metav1.Time{Time: *changeInfo.SubmittedAt}
 	} else {
 		ko.Status.SubmittedAt = nil
 	}
@@ -421,16 +441,32 @@ func (rm *resourceManager) sdkDelete(
 	defer func() {
 		exit(err)
 	}()
+
+	recordSet, err := rm.newResourceRecordSet(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+
+	if rm.batchAggregator != nil {
+		// Use batch aggregator for improved throughput
+		result := rm.batchAggregator.Submit(ctx, batch.RecordChange{
+			HostedZoneID: aws.ToString(r.ko.Spec.HostedZoneID),
+			Action:       svcsdktypes.ChangeActionDelete,
+			RecordSet:    recordSet,
+		})
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		return nil, nil
+	}
+
+	// Fallback: direct API call (original behavior)
 	input, err := rm.newDeleteRequestPayload(r)
 	if err != nil {
 		return nil, err
 	}
 
 	action := svcsdktypes.ChangeActionDelete
-	recordSet, err := rm.newResourceRecordSet(ctx, r)
-	if err != nil {
-		return nil, err
-	}
 	changeBatch := rm.newChangeBatch(action, recordSet)
 	input.ChangeBatch = changeBatch
 

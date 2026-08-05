@@ -38,6 +38,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	svcapitypes "github.com/aws-controllers-k8s/route53-controller/apis/v1alpha1"
+	"github.com/aws-controllers-k8s/route53-controller/pkg/batch"
 )
 
 var (
@@ -80,6 +81,12 @@ type resourceManager struct {
 	// sdk is a pointer to the AWS service API client exposed by the
 	// aws-sdk-go-v2/services/{alias} package.
 	sdkapi *svcsdk.Client
+	// batchAggregator is the shared batch aggregator for Route53 changes.
+	// When non-nil, create/update/delete operations submit through the
+	// aggregator instead of making direct API calls.
+	batchAggregator *batch.Aggregator
+	// hostedZoneCache caches GetHostedZone domain lookups.
+	hostedZoneCache *batch.HostedZoneCache
 }
 
 // concreteResource returns a pointer to a resource from the supplied
@@ -339,17 +346,21 @@ func newResourceManager(
 	rr acktypes.Reconciler,
 	id ackv1alpha1.AWSAccountID,
 	region ackv1alpha1.AWSRegion,
+	batchAgg *batch.Aggregator,
+	hzCache *batch.HostedZoneCache,
 ) (*resourceManager, error) {
 	return &resourceManager{
-		cfg:          cfg,
-		clientcfg:    clientcfg,
-		log:          log,
-		metrics:      metrics,
-		rr:           rr,
-		awsAccountID: id,
-		awsRegion:    region,
-		awsPartition: ackv1alpha1.AWSPartition(cfg.Partition),
-		sdkapi:       svcsdk.NewFromConfig(clientcfg),
+		cfg:             cfg,
+		clientcfg:       clientcfg,
+		log:             log,
+		metrics:         metrics,
+		rr:              rr,
+		awsAccountID:    id,
+		awsRegion:       region,
+		awsPartition:    ackv1alpha1.AWSPartition(cfg.Partition),
+		sdkapi:          svcsdk.NewFromConfig(clientcfg),
+		batchAggregator: batchAgg,
+		hostedZoneCache: hzCache,
 	}, nil
 }
 

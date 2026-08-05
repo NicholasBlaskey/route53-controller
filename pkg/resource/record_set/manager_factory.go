@@ -16,16 +16,23 @@
 package record_set
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	ackv1alpha1 "github.com/aws-controllers-k8s/runtime/apis/core/v1alpha1"
 	ackcfg "github.com/aws-controllers-k8s/runtime/pkg/config"
 	ackmetrics "github.com/aws-controllers-k8s/runtime/pkg/metrics"
 	acktypes "github.com/aws-controllers-k8s/runtime/pkg/types"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	svcsdk "github.com/aws/aws-sdk-go-v2/service/route53"
 	"github.com/go-logr/logr"
+	ctrlrt "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/aws-controllers-k8s/route53-controller/pkg/batch"
 	svcresource "github.com/aws-controllers-k8s/route53-controller/pkg/resource"
 )
 
@@ -35,6 +42,11 @@ type resourceManagerFactory struct {
 	sync.RWMutex
 	// rmCache contains resource managers for a particular AWS account ID
 	rmCache map[string]*resourceManager
+	// batchAggregator is the shared batch aggregator for all resource managers.
+	// Initialized lazily on first ManagerFor call.
+	batchAggregator *batch.Aggregator
+	// hostedZoneCache is the shared domain cache for all resource managers.
+	hostedZoneCache *batch.HostedZoneCache
 }
 
 // ResourcePrototype returns an AWSResource that resource managers produced by
@@ -70,7 +82,21 @@ func (f *resourceManagerFactory) ManagerFor(
 	f.Lock()
 	defer f.Unlock()
 
-	rm, err := newResourceManager(cfg, clientcfg, log, metrics, rr, id, region)
+	// Lazily initialize the shared batch aggregator and cache on first use.
+	// All resource managers (even for different accounts/regions) share the
+	// same aggregator since batching is per-hostedZoneID.
+	if f.batchAggregator == nil {
+		sdkClient := svcsdk.NewFromConfig(clientcfg)
+		f.hostedZoneCache = batch.NewHostedZoneCache(10*time.Minute, log)
+		f.batchAggregator = batch.NewAggregator(
+			sdkClient,
+			metrics,
+			log,
+			batch.DefaultConfig(),
+		)
+	}
+
+	rm, err := newResourceManager(cfg, clientcfg, log, metrics, rr, id, region, f.batchAggregator, f.hostedZoneCache)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +118,42 @@ func (f *resourceManagerFactory) RequeueOnSuccessSeconds() int {
 func newResourceManagerFactory() *resourceManagerFactory {
 	return &resourceManagerFactory{
 		rmCache: map[string]*resourceManager{},
+	}
+}
+
+// GetBatchReconciler implements acktypes.BatchReconcilerProvider.
+// It returns a batch reconciler that groups RecordSet CRs by hosted zone
+// and issues a single ChangeResourceRecordSets call per zone per batch.
+func (f *resourceManagerFactory) GetBatchReconciler(mgr ctrlrt.Manager) (reconcile.BatchReconciler, reconcile.BatchConfig) {
+	f.Lock()
+	defer f.Unlock()
+
+	// Load the default AWS config from the environment (same credentials the
+	// controller uses). This ensures the batch reconciler has valid creds.
+	// Disable the SDK's client-side retry rate limiter — we handle retries
+	// at the batch level and don't want the token bucket blocking us.
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion("us-west-2"))
+	if err != nil {
+		// If we can't load AWS config, skip batch reconciling
+		return nil, reconcile.BatchConfig{}
+	}
+
+	sdkClient := svcsdk.NewFromConfig(awsCfg, func(o *svcsdk.Options) {
+		o.RetryMaxAttempts = 1
+	})
+	hzCache := batch.NewHostedZoneCache(10*time.Minute, ctrlrt.Log)
+
+	br := NewListDrivenBatchReconciler(
+		mgr.GetClient(),
+		sdkClient,
+		ctrlrt.Log,
+		nil,
+		hzCache,
+	)
+
+	return br, reconcile.BatchConfig{
+		MaxBatchSize: 500,
+		MaxWait:      2 * time.Second,
 	}
 }
 
